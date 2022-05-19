@@ -14,6 +14,7 @@ import (
 	"github.com/cli/cli/v2/api"
 	"github.com/cli/cli/v2/git"
 	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/ghinstance"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/cli/cli/v2/internal/run"
 	"github.com/cli/cli/v2/pkg/cmdutil"
@@ -23,15 +24,16 @@ import (
 )
 
 type CreateOptions struct {
-	HttpClient func() (*http.Client, error)
-	Config     func() (config.Config, error)
-	IO         *iostreams.IOStreams
-
+	HttpClient        func() (*http.Client, error)
+	Config            func() (config.Config, error)
+	IO                *iostreams.IOStreams
+	Browser           cmdutil.Browser
 	Name              string
 	Description       string
 	Homepage          string
 	Team              string
 	Template          string
+	Stack             string
 	Public            bool
 	Private           bool
 	Internal          bool
@@ -52,6 +54,7 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
 		Config:     f.Config,
+		Browser:    f.Browser,
 	}
 
 	var enableIssues bool
@@ -155,6 +158,7 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 	cmd.Flags().StringVarP(&opts.Homepage, "homepage", "h", "", "Repository home page `URL`")
 	cmd.Flags().StringVarP(&opts.Team, "team", "t", "", "The `name` of the organization team to be granted access")
 	cmd.Flags().StringVarP(&opts.Template, "template", "p", "", "Make the new repository based on a template `repository`")
+	cmd.Flags().StringVarP(&opts.Stack, "stack", "q", "", "Make the new repository based on a stack `repository`")
 	cmd.Flags().BoolVar(&opts.Public, "public", false, "Make the new repository public")
 	cmd.Flags().BoolVar(&opts.Private, "private", false, "Make the new repository private")
 	cmd.Flags().BoolVar(&opts.Internal, "internal", false, "Make the new repository internal")
@@ -167,6 +171,7 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 	cmd.Flags().BoolVar(&opts.DisableIssues, "disable-issues", false, "Disable issues in the new repository")
 	cmd.Flags().BoolVar(&opts.DisableWiki, "disable-wiki", false, "Disable wiki in the new repository")
 
+	
 	// deprecated flags
 	cmd.Flags().BoolP("confirm", "y", false, "Skip the confirmation prompt")
 	cmd.Flags().BoolVar(&enableIssues, "enable-issues", true, "Enable issues in the new repository")
@@ -332,6 +337,73 @@ func createFromScratch(opts *CreateOptions) error {
 
 		input.TemplateRepositoryID = repo.ID
 		templateRepoMainBranch = repo.DefaultBranchRef.Name
+	}
+
+	stdout := opts.IO.Out
+	if opts.Stack != "" {
+		var stackRepo ghrepo.Interface
+		apiClient := api.NewClientFromHTTP(httpClient)
+
+		stackRepoName := opts.Stack
+		if !strings.Contains(stackRepoName, "/") {
+			host, err := cfg.DefaultHost()
+			if err != nil {
+				return err
+			}
+			currentUser, err := api.CurrentLoginName(apiClient, host)
+			if err != nil {
+				return err
+			}
+			stackRepoName = currentUser + "/" + stackRepoName
+		}
+		stackRepo, err = ghrepo.FromFullName(stackRepoName)
+		if err != nil {
+			return fmt.Errorf("argument error: %w", err)
+		}
+
+		repo, err := api.GitHubRepo(apiClient, stackRepo)
+		if err != nil {
+			return err
+		}
+
+		// fmt.Fprintf(stdout, "Obtaining releases...\n")
+		releases, err := listReleases(opts, httpClient, stackRepo, repo.RepoHost())
+		if err != nil {
+			return err
+		}
+
+		// fmt.Fprintf(stdout, "seeking release...\n")
+		releaseTag, err := interactiveStackReleaseTag(releases)
+		if err != nil {
+			return err
+		}
+
+		stackData, err := getStackData(opts, httpClient, releaseTag, stackRepo, repo.RepoHost())
+		if err != nil {
+			return err
+		}
+
+		var stackInputs map[string]interface{}
+		stackInputs, err = interactiveStackInputs(stackData)
+		if err != nil {
+			return err
+		}
+
+		params := createRepositoryFromStackInput{
+			Name:       repoToCreate.RepoName(),
+			OwnerLogin: repoToCreate.RepoOwner(),
+			ReleaseTag: releaseTag,
+			Inputs:     stackInputs,
+			Private:    opts.Private,
+		}
+
+		fmt.Fprintf(stdout, "Creating repo from stack...\n")
+		createRepoFromStack(opts, httpClient, repo, repo.RepoHost(), params)
+		fmt.Fprintf(stdout, "Done!\n")
+
+		stackInProgressUrl := fmt.Sprintf("%s%s/%s", ghinstance.HostPrefix(repo.RepoHost()), repoToCreate.RepoOwner(), repoToCreate.RepoName())
+		fmt.Fprintf(stdout, "Browse here: %s\n", stackInProgressUrl)
+		return opts.Browser.Browse(stackInProgressUrl)
 	}
 
 	repo, err := repoCreate(httpClient, repoToCreate.RepoHost(), input)
@@ -769,6 +841,77 @@ func interactiveLicense(client *http.Client, hostname string) (string, error) {
 		return licenseKey[wantedLicense], nil
 	}
 	return "", nil
+}
+
+func interactiveStackReleaseTag(releases []string) (string, error) {
+	qs := []*survey.Question{}
+
+	getReleaseTagQuestion := &survey.Question{
+		Name: "releaseTag",
+		Prompt: &survey.Select{
+			Message: "Release tag: ",
+			Options: releases,
+			Default: releases[0],
+		},
+	}
+
+	qs = append(qs, getReleaseTagQuestion)
+
+	answer := struct {
+		ReleaseTag string
+	}{}
+
+	err := prompt.SurveyAsk(qs, &answer)
+	if err != nil {
+		return "", err
+	}
+
+	return answer.ReleaseTag, nil
+}
+
+func interactiveStackInputs(sd stackData) (map[string]interface{}, error) {
+	qs := []*survey.Question{}
+
+	for _, input := range sd.Inputs {
+		var inputQuestion *survey.Question
+		isSecret := false
+		if input["is-secret"] != nil {
+			isSecret = input["is-secret"].(bool)
+		}
+
+		if isSecret {
+			inputQuestion = &survey.Question{
+				Name: input["name"].(string),
+				Prompt: &survey.Password{
+					Message: fmt.Sprintf("%s (%s)", input["name"], input["description"]),
+				},
+			}
+		} else {
+			defaultValue := ""
+			if input["default"] != nil {
+				defaultValue = input["default"].(string)
+			}
+
+			inputQuestion = &survey.Question{
+				Name: input["name"].(string),
+				Prompt: &survey.Input{
+					Message: fmt.Sprintf("%s (%s)", input["name"], input["description"]),
+					Default: defaultValue,
+				},
+			}
+		}
+
+		qs = append(qs, inputQuestion)
+	}
+
+	answers := map[string]interface{}{}
+	err := prompt.SurveyAsk(qs, &answers)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return answers, nil
 }
 
 // name, description, and visibility
