@@ -171,6 +171,7 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 	cmd.Flags().BoolVar(&opts.DisableIssues, "disable-issues", false, "Disable issues in the new repository")
 	cmd.Flags().BoolVar(&opts.DisableWiki, "disable-wiki", false, "Disable wiki in the new repository")
 
+	
 	// deprecated flags
 	cmd.Flags().BoolP("confirm", "y", false, "Skip the confirmation prompt")
 	cmd.Flags().BoolVar(&enableIssues, "enable-issues", true, "Enable issues in the new repository")
